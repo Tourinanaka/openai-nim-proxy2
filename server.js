@@ -121,13 +121,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
-        const lines = buffer.split('\n');
+        const lines = buffer.split('\\n');
         buffer = lines.pop() || '';
         
         lines.forEach(line => {
           if (line.startsWith('data: ')) {
             if (line.includes('[DONE]')) {
-              res.write(line + '\n');
+              res.write(line + '\\n');
               return;
             }
             
@@ -169,7 +169,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
             } catch (e) {
-              res.write(line + '\n');
+              res.write(line + '\\n');
             }
           }
         });
