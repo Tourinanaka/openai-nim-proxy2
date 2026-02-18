@@ -1,4 +1,3 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -6,21 +5,20 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
-const SHOW_REASONING = true; // Set to true to show reasoning with <think> tags
+if (!NIM_API_KEY) {
+  console.error('FATAL: NIM_API_KEY environment variable is not set');
+  process.exit(1);
+}
 
-// 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
-const ENABLE_THINKING_MODE = true; // Set to true to enable chat_template_kwargs thinking parameter
+const SHOW_REASONING = true;
+const ENABLE_THINKING_MODE = true;
 
-// Model mapping (adjust based on available NIM models)
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -28,178 +26,270 @@ const MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'claude-3-opus': 'z-ai/glm4.7',
   'claude-3-sonnet': 'z-ai/glm5',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
 };
 
-// Health check endpoint
+// ✅ 修正①: thinking対応モデルを明示的に定義
+const THINKING_CAPABLE_MODELS = new Set([
+  'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'qwen/qwen3-235b-a22b',
+  'qwen/qwen3-next-80b-a3b-thinking',
+  'qwen/qwen3-coder-480b-a35b-instruct',
+  // 必要に応じて追加
+]);
+
+const verifiedModels = new Map();
+
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+  res.json({
+    status: 'ok',
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE
   });
 });
 
-// List models endpoint (OpenAI compatible)
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
     object: 'model',
-    created: Date.now(),
+    created: Math.floor(Date.now() / 1000),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
-  res.json({
-    object: 'list',
-    data: models
-  });
+  res.json({ object: 'list', data: models });
 });
 
-// Chat completions endpoint (main proxy)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    
-    // Smart model selection with fallback
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
+        error: {
+          message: "'messages' is required and must be a non-empty array",
+          type: 'invalid_request_error',
+          code: 400
+        }
+      });
+    }
+
+    // モデル解決（既存ロジック）
     let nimModel = MODEL_MAPPING[model];
+
     if (!nimModel) {
-      try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
+      if (verifiedModels.has(model)) {
+        nimModel = verifiedModels.get(model);
+      } else {
+        try {
+          const probeResponse = await axios.post(
+            `${NIM_API_BASE}/chat/completions`,
+            { model, messages: [{ role: 'user', content: 'test' }], max_tokens: 1 },
+            {
+              headers: {
+                'Authorization': `Bearer ${NIM_API_KEY}`,
+                'Content-Type': 'application/json'
+              },
+              timeout: 10000,
+              validateStatus: (s) => s < 500
+            }
+          );
+          if (probeResponse.status >= 200 && probeResponse.status < 300) {
             nimModel = model;
+            verifiedModels.set(model, model);
+          } else {
+            verifiedModels.set(model, null);
           }
-        });
-      } catch (e) {}
-      
+        } catch (e) {
+          console.warn('Model probe failed:', e.message);
+          verifiedModels.set(model, null);
+        }
+      }
+
       if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
+        const ml = model.toLowerCase();
+        if (ml.includes('gpt-4') || ml.includes('claude-opus') || ml.includes('405b')) {
           nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
+        } else if (ml.includes('claude') || ml.includes('gemini') || ml.includes('70b')) {
           nimModel = 'meta/llama-3.1-70b-instruct';
         } else {
           nimModel = 'meta/llama-3.1-8b-instruct';
         }
       }
     }
-    
-    // Transform OpenAI request to NIM format
+
+    // ✅ 修正②: thinking対応モデルかどうか判定
+    const useThinking = ENABLE_THINKING_MODE
+      && THINKING_CAPABLE_MODELS.has(nimModel);
+
+    console.log(`[PROXY] ${model} -> ${nimModel} | thinking: ${useThinking}`);
+
     const nimRequest = {
       model: nimModel,
-      messages: messages,
-      temperature: temperature || 0.6,
-      max_tokens: max_tokens || 9024,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
-      stream: stream || false
+      messages,
+      temperature: temperature || 0.85,
+      max_tokens: max_tokens || 16384,  // ✅ 修正③: 増量
+      stream: stream || false,
+      ...(useThinking && { chat_template_kwargs: { thinking: true } })
     };
-    
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json'
-    });
-    
+
+    const response = await axios.post(
+      `${NIM_API_BASE}/chat/completions`,
+      nimRequest,
+      {
+        headers: {
+          'Authorization': `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 300000,  // ✅ 修正④: 5分に延長
+        responseType: stream ? 'stream' : 'json'
+      }
+    );
+
     if (stream) {
-      // Handle streaming response with reasoning
+      // === ストリーミング処理 ===
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      
+
       let buffer = '';
       let reasoningStarted = false;
-      
+
       response.data.on('data', (chunk) => {
         buffer += chunk.toString();
-        const lines = buffer.split('\\n');
+        const lines = buffer.split('\n');
         buffer = lines.pop() || '';
-        
-        lines.forEach(line => {
-          if (line.startsWith('data: ')) {
-            if (line.includes('[DONE]')) {
-              res.write(line + '\\n');
-              return;
+
+        lines.forEach(rawLine => {
+          const line = rawLine.replace(/\r$/, '');  // ✅ 修正⑤
+
+          if (!line.startsWith('data:')) return;
+          if (line.includes('[DONE]')) {
+            if (SHOW_REASONING && reasoningStarted) {
+              res.write(`data: ${JSON.stringify({
+                choices: [{ index: 0, delta: { content: '</think>\n\n' } }]
+              })}\n\n`);
+              reasoningStarted = false;
             }
-            
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
-                const content = data.choices[0].delta.content;
-                
-                if (SHOW_REASONING) {
-                  let combinedContent = '';
-                  
-                  if (reasoning && !reasoningStarted) {
-                    combinedContent = '<think>\n' + reasoning;
-                    reasoningStarted = true;
-                  } else if (reasoning) {
-                    combinedContent = reasoning;
-                  }
-                  
-                  if (content && reasoningStarted) {
-                    combinedContent += '</think>\n\n' + content;
-                    reasoningStarted = false;
-                  } else if (content) {
-                    combinedContent += content;
-                  }
-                  
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                    delete data.choices[0].delta.reasoning_content;
-                  }
-                } else {
-                  if (content) {
-                    data.choices[0].delta.content = content;
-                  } else {
-                    data.choices[0].delta.content = '';
-                  }
-                  delete data.choices[0].delta.reasoning_content;
+            res.write('data: [DONE]\n\n');
+            return;
+          }
+
+          try {
+            const jsonStr = line.replace(/^data:\s*/, '');
+            const data = JSON.parse(jsonStr);
+
+            if (data.choices?.[0]?.delta) {
+              const reasoning = data.choices[0].delta.reasoning_content;
+              const content = data.choices[0].delta.content;
+
+              if (SHOW_REASONING) {
+                // ✅ 修正⑥: 閉じタグを別チャンクで送信
+                if (reasoningStarted && !reasoning && content) {
+                  res.write(`data: ${JSON.stringify({
+                    id: data.id,
+                    object: data.object,
+                    choices: [{
+                      index: 0,
+                      delta: { content: '</think>\n\n' },
+                      finish_reason: null
+                    }]
+                  })}\n\n`);
+                  reasoningStarted = false;
                 }
+
+                let combinedContent = '';
+                if (reasoning && !reasoningStarted) {
+                  combinedContent = '<think>\n' + reasoning;
+                  reasoningStarted = true;
+                } else if (reasoning) {
+                  combinedContent = reasoning;
+                }
+                if (content) {
+                  combinedContent += content;
+                }
+
+                // ✅ 修正⑦: 常に明示的に設定
+                data.choices[0].delta.content = combinedContent;
+              } else {
+                data.choices[0].delta.content = content || '';
               }
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
-            } catch (e) {
-              res.write(line + '\\n');
+
+              delete data.choices[0].delta.reasoning_content;
             }
+
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          } catch (e) {
+            console.warn('SSE parse error:', e.message);
           }
         });
       });
-      
-      response.data.on('end', () => res.end());
-      response.data.on('error', (err) => {
-        console.error('Stream error:', err);
+
+      response.data.on('end', () => {
+        if (SHOW_REASONING && reasoningStarted) {
+          res.write(`data: ${JSON.stringify({
+            choices: [{ index: 0, delta: { content: '</think>\n\n' } }]
+          })}\n\n`);
+        }
         res.end();
       });
+
+      response.data.on('error', (err) => {
+        console.error('Stream error:', err.message);
+        res.end();
+      });
+
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      // === 非ストリーミング処理 ===
+
+      // ✅ 修正⑧: デバッグログ（原因切り分け用）
+      const rawContent = response.data.choices?.[0]?.message?.content;
+      const rawReasoning = response.data.choices?.[0]?.message?.reasoning_content;
+      console.log('[DEBUG] raw content has newlines:',
+        rawContent ? rawContent.includes('\n') : 'null');
+      console.log('[DEBUG] raw content sample:',
+        rawContent ? JSON.stringify(rawContent.substring(0, 300)) : 'null');
+      console.log('[DEBUG] reasoning_content exists:', !!rawReasoning);
+
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
         choices: response.data.choices.map(choice => {
-          let fullContent = choice.message?.content || '';
-          
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
+          let content = choice.message?.content || '';
+          const reasoning = choice.message?.reasoning_content || '';
+
+          // ✅ 修正⑨: thinking非対応モデルが<think>を本文に混ぜた場合の処理
+          if (!useThinking && !reasoning && content.includes('<think>')) {
+            const thinkMatch = content.match(
+              /^<think>([\s\S]*?)<\/think>\s*([\s\S]*)$/
+            );
+            if (thinkMatch) {
+              const extractedReasoning = thinkMatch[1].trim();
+              const extractedContent = thinkMatch[2].trim();
+              if (SHOW_REASONING) {
+                content = '<think>\n' + extractedReasoning
+                  + '\n</think>\n\n' + extractedContent;
+              } else {
+                content = extractedContent;
+              }
+              return {
+                index: choice.index,
+                message: { role: choice.message.role, content },
+                finish_reason: choice.finish_reason
+              };
+            }
           }
-          
+
+          // 通常のreasoning_content処理
+          if (SHOW_REASONING && reasoning) {
+            content = '<think>\n' + reasoning
+              + '\n</think>\n\n' + content;
+          }
+
           return {
             index: choice.index,
-            message: {
-              role: choice.message.role,
-              content: fullContent
-            },
+            message: { role: choice.message.role, content },
             finish_reason: choice.finish_reason
           };
         }),
@@ -209,24 +299,25 @@ app.post('/v1/chat/completions', async (req, res) => {
           total_tokens: 0
         }
       };
-      
+
       res.json(openaiResponse);
     }
-    
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
-    res.status(error.response?.status || 500).json({
-      error: {
-        message: error.message || 'Internal server error',
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
-    });
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({
+        error: {
+          message: error.message || 'Internal server error',
+          type: 'invalid_request_error',
+          code: error.response?.status || 500
+        }
+      });
+    } else {
+      res.end();
+    }
   }
 });
 
-// Catch-all for unsupported endpoints
 app.all('*', (req, res) => {
   res.status(404).json({
     error: {
@@ -238,8 +329,6 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Proxy running on port ${PORT}`);
+  console.log(`Reasoning: ${SHOW_REASONING} | Thinking: ${ENABLE_THINKING_MODE}`);
 });
