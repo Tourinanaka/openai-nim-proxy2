@@ -16,7 +16,7 @@ if (!NIM_API_KEY) {
   process.exit(1);
 }
 
-const SHOW_REASONING = true;
+const SHOW_REASONING = false;
 const ENABLE_THINKING_MODE = true;
 
 const MODEL_MAPPING = {
