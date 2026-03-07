@@ -11,16 +11,6 @@ app.use(express.json());
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-const FORMAT_RULE = [
-  '\n\n[MANDATORY FORMATTING]',
-  'You MUST format your response with proper paragraph breaks.',
-  'Use a blank line (double newline) between:',
-  '- Each new paragraph of narration',
-  '- Before and after dialogue lines',
-  '- Before and after action/emote lines',
-  'NEVER write everything in one unbroken block.',
-].join('\n');
-
 // ── Clean history before sending to API ─────────────────
 function prepareMessages(messages) {
   const cleaned = messages.map(msg => {
