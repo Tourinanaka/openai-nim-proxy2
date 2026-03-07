@@ -13,22 +13,11 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // ── Clean history before sending to API ─────────────────
 function prepareMessages(messages) {
-  const cleaned = messages.map(msg => {
+  return messages.map(msg => {
     let content = typeof msg.content === 'string' ? msg.content : '';
-    // Strip <think> blocks so they don't pile up in context
     content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trim();
     return { role: msg.role, content: content || '(continue)' };
   });
-
-  // Inject formatting rule into system prompt
-  const sysIdx = cleaned.findIndex(m => m.role === 'system');
-  if (sysIdx !== -1) {
-    cleaned[sysIdx].content += FORMAT_RULE;
-  } else {
-    cleaned.unshift({ role: 'system', content: FORMAT_RULE.trim() });
-  }
-
-  return cleaned;
 }
 
 // ── Force linebreaks into model output ──────────────────
@@ -37,17 +26,11 @@ function enforceLineBreaks(text) {
 
   // CASE 1: Complete wall of text — no double newlines at all
   if (text.length > 200 && !text.includes('\n\n')) {
-
-    // Before dialogue opening
     text = text.replace(/([.!?])\s+(")/g, '$1\n\n$2');
-    // Before action/emote markers
     text = text.replace(/([.!?""''"])\s+(\*)/g, '$1\n\n$2');
-    // After action/emote markers end
     text = text.replace(/(\*)\s+([A-Z"""])/g, '$1\n\n$2');
-    // After dialogue closing + narration
     text = text.replace(/(["""'])\s+([A-Z])/g, '$1\n\n$2');
 
-    // Last resort: if STILL a wall, break every ~3 sentences
     if (text.length > 400 && !text.includes('\n\n')) {
       let count = 0;
       text = text.replace(/([.!?])\s+([A-Z])/g, (match, p1, p2) => {
@@ -58,9 +41,14 @@ function enforceLineBreaks(text) {
   }
 
   // CASE 2: Has single newlines that should be doubles
-  text = text.replace(/([^\n])\n(")/g,      '$1\n\n$2');
-  text = text.replace(/([^\n])\n(\*)/g,     '$1\n\n$2');
+  text = text.replace(/([^\n])\n(")/g, '$1\n\n$2');
+  text = text.replace(/([^\n])\n(\*)/g, '$1\n\n$2');
   text = text.replace(/(["""'])\n([A-Z*])/g, '$1\n\n$2');
+
+  // Scene breaks and stage directions
+  text = text.replace(/([.!?""'*])\s+([-—]{2,})/g, '$1\n\n$2');
+  text = text.replace(/([.!?""'*])\s+(\[)/g, '$1\n\n$2');
+  text = text.replace(/(\])\s+([A-Z"*])/g, '$1\n\n$2');
 
   // Collapse 3+ newlines down to 2
   text = text.replace(/\n{3,}/g, '\n\n');
@@ -87,7 +75,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { model, messages, temperature, max_tokens } = req.body;
     const preparedMessages = prepareMessages(messages);
 
-    // Debug log
     console.log('\n── Turn ──');
     console.log(`  Messages in history: ${messages.length}`);
     messages.slice(-2).forEach(m => {
@@ -120,8 +107,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       choices: response.data.choices.map(choice => {
         let content = choice.message?.content || '';
 
-        // ── Extract thinking from content ──
-        // clear_thinking:false → thinking is embedded as <think> tags in content
         let thinkBlock = '';
         let body = content;
 
@@ -131,15 +116,12 @@ app.post('/v1/chat/completions', async (req, res) => {
           body = thinkMatch[2];
         }
 
-        // Fallback: if thinking was in separate field instead
         if (!thinkBlock && choice.message?.reasoning_content) {
           thinkBlock = '<think>\n' + choice.message.reasoning_content + '\n</think>';
         }
 
-        // ── Enforce linebreaks on response body only ──
         body = enforceLineBreaks(body);
 
-        // ── Recombine: thinking stays visible ──
         const finalContent = thinkBlock
           ? thinkBlock + '\n\n' + body
           : body;
