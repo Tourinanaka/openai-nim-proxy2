@@ -86,7 +86,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       model: 'z-ai/glm5',
       messages: preparedMessages,
       temperature: temperature || 0.85,
-      max_tokens: max_tokens || 100000,
+      max_tokens: max_tokens || 9024,
       stream: false,
       chat_template_kwargs: {
         enable_thinking: true,
