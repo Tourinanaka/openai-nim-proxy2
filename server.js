@@ -27,11 +27,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages,
       temperature: temperature ?? 0.85,
       max_tokens: max_tokens ?? 9024,
-      extra_body: {
-        chat_template_kwargs: {
-          enable_thinking: true,
-          clear_thinking: false
-        }
+      chat_template_kwargs: {
+        thinking: true,
+        enable_thinking: true,
+        clear_thinking: false
       },
       stream: true
     }, {
