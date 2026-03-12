@@ -27,7 +27,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages,
       temperature: temperature ?? 0.85,
       max_tokens: max_tokens ?? 9024,
-      extra_body: { chat_template_kwargs: { thinking: true } },
+      extra_body: {
+        chat_template_kwargs: {
+          thinking: true,
+          enable_thinking: true,
+          clear_thinking: false
+        }
+      },
       stream: true
     }, {
       headers: { 'Authorization': `Bearer ${NIM_KEY}`, 'Content-Type': 'application/json' },
@@ -55,7 +61,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           const delta = data.choices?.[0]?.delta;
 
           if (delta) {
-            // Fix literal \n → actual newline
             let r = (delta.reasoning_content || '').replace(/\\n/g, '\n');
             let c = (delta.content || '').replace(/\\n/g, '\n');
             let out = '';
