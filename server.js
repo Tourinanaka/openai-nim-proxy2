@@ -23,7 +23,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const { messages, temperature, max_tokens } = req.body;
 
     const nimRes = await axios.post(`${NIM_BASE}/chat/completions`, {
-      model: 'z-ai/glm5',
+      model: 'z-ai/glm4.7',
       messages,
       temperature: temperature ?? 0.85,
       max_tokens: max_tokens ?? 9024,
