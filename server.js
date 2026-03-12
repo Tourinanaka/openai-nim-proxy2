@@ -11,16 +11,8 @@ app.use(express.json());
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Axios instance with extended timeout (5 minutes)
-const apiClient = axios.create({
-  timeout: 300000,
-  headers: {
-    'Authorization': `Bearer ${NIM_API_KEY}`,
-    'Content-Type': 'application/json'
-  }
-});
+// ── Utility functions ───────────────────────────────────
 
-// ── Clean history before sending to API ─────────────────
 function prepareMessages(messages) {
   return messages.map(msg => {
     let content = typeof msg.content === 'string' ? msg.content : '';
@@ -29,11 +21,9 @@ function prepareMessages(messages) {
   });
 }
 
-// ── Force linebreaks into model output ──────────────────
 function enforceLineBreaks(text) {
   text = text.replace(/\r\n/g, '\n');
 
-  // CASE 1: Complete wall of text — no double newlines at all
   if (text.length > 200 && !text.includes('\n\n')) {
     text = text.replace(/([.!?])\s+(")/g, '$1\n\n$2');
     text = text.replace(/([.!?""''"])\s+(\*)/g, '$1\n\n$2');
@@ -49,20 +39,116 @@ function enforceLineBreaks(text) {
     }
   }
 
-  // CASE 2: Has single newlines that should be doubles
   text = text.replace(/([^\n])\n(")/g, '$1\n\n$2');
   text = text.replace(/([^\n])\n(\*)/g, '$1\n\n$2');
   text = text.replace(/(["""'])\n([A-Z*])/g, '$1\n\n$2');
-
-  // Scene breaks and stage directions
   text = text.replace(/([.!?""'*])\s+([-—]{2,})/g, '$1\n\n$2');
   text = text.replace(/([.!?""'*])\s+(\[)/g, '$1\n\n$2');
   text = text.replace(/(\])\s+([A-Z"*])/g, '$1\n\n$2');
-
-  // Collapse 3+ newlines down to 2
   text = text.replace(/\n{3,}/g, '\n\n');
 
   return text;
+}
+
+function processContent(content) {
+  let thinkBlock = '';
+  let body = content;
+
+  const thinkMatch = content.match(/^\s*(<think>[\s\S]*?<\/think>)\s*([\s\S]*)$/);
+  if (thinkMatch) {
+    thinkBlock = thinkMatch[1];
+    body = thinkMatch[2];
+  }
+
+  body = enforceLineBreaks(body);
+  return thinkBlock ? thinkBlock + '\n\n' + body : body;
+}
+
+// ── Fetch from NIM using streaming to prevent timeout ───
+
+async function fetchFromNIM(preparedMessages, temperature, max_tokens) {
+  // Try streaming first (keeps connection alive)
+  try {
+    return await streamFromNIM(preparedMessages, temperature, max_tokens);
+  } catch (err) {
+    console.log(`    Stream mode failed (${err.message}), trying non-stream...`);
+    return await nonStreamFromNIM(preparedMessages, temperature, max_tokens);
+  }
+}
+
+async function streamFromNIM(preparedMessages, temperature, max_tokens) {
+  const response = await axios.post(`${NIM_API_BASE}/chat/completions`, {
+    model: 'z-ai/glm5',
+    messages: preparedMessages,
+    temperature: temperature || 0.85,
+    max_tokens: max_tokens || 9024,
+    stream: true,
+    chat_template_kwargs: { enable_thinking: true, clear_thinking: false }
+  }, {
+    headers: {
+      'Authorization': `Bearer ${NIM_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    responseType: 'stream',
+    timeout: 300000
+  });
+
+  return new Promise((resolve, reject) => {
+    let fullContent = '';
+    let finishReason = 'stop';
+    let usage = null;
+    let buf = '';
+
+    response.data.on('data', (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.choices?.[0]?.delta?.content) {
+            fullContent += parsed.choices[0].delta.content;
+          }
+          if (parsed.choices?.[0]?.finish_reason) {
+            finishReason = parsed.choices[0].finish_reason;
+          }
+          if (parsed.usage) usage = parsed.usage;
+        } catch (e) {}
+      }
+    });
+
+    response.data.on('end', () => resolve({ fullContent, finishReason, usage }));
+    response.data.on('error', reject);
+  });
+}
+
+async function nonStreamFromNIM(preparedMessages, temperature, max_tokens) {
+  const response = await axios.post(`${NIM_API_BASE}/chat/completions`, {
+    model: 'z-ai/glm5',
+    messages: preparedMessages,
+    temperature: temperature || 0.85,
+    max_tokens: max_tokens || 9024,
+    stream: false,
+    chat_template_kwargs: { enable_thinking: true, clear_thinking: false }
+  }, {
+    headers: {
+      'Authorization': `Bearer ${NIM_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 300000
+  });
+
+  const choice = response.data.choices?.[0];
+  return {
+    fullContent: choice?.message?.content || '',
+    finishReason: choice?.finish_reason || 'stop',
+    usage: response.data.usage || null
+  };
 }
 
 // ── Routes ──────────────────────────────────────────────
@@ -83,104 +169,122 @@ app.post('/v1/chat/completions', async (req, res) => {
   req.setTimeout(300000);
   res.setTimeout(300000);
 
-  try {
-    const { model, messages, temperature, max_tokens } = req.body;
-    const preparedMessages = prepareMessages(messages);
+  const { model, messages, temperature, max_tokens } = req.body;
+  const preparedMessages = prepareMessages(messages);
+  const wantsStream = req.body.stream === true;
 
-    console.log('\n── Turn ──');
-    console.log(`  Messages in history: ${messages.length}`);
-    messages.slice(-2).forEach(m => {
-      const preview = (m.content || '').substring(0, 200).replace(/\n/g, '\\n');
-      console.log(`  [${m.role}] ${preview}`);
-    });
-    console.log(`  Sending to NIM API...`);
-    const startTime = Date.now();
+  console.log('\n── Turn ──');
+  console.log(`  Messages: ${messages.length} | Client wants stream: ${wantsStream}`);
+  const startTime = Date.now();
 
-    // ── Retry logic: 3 attempts ──
-    let response;
+  if (wantsStream) {
+    // ── STREAMING: SSE with heartbeats — fully timeout-proof ──
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const heartbeat = setInterval(() => {
+      res.write(': heartbeat\n\n');
+    }, 15000);
+
     let lastError;
-
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        response = await apiClient.post(`${NIM_API_BASE}/chat/completions`, {
-          model: 'z-ai/glm5',
-          messages: preparedMessages,
-          temperature: temperature || 0.85,
-          max_tokens: max_tokens || 9024,
-          stream: false,
-          chat_template_kwargs: {
-            enable_thinking: true,
-            clear_thinking: false
-          }
-        });
-        console.log(`  Response received in ${((Date.now() - startTime) / 1000).toFixed(1)}s (attempt ${attempt})`);
-        break;
+        console.log(`  Attempt ${attempt}...`);
+        const { fullContent, finishReason } = await fetchFromNIM(
+          preparedMessages, temperature, max_tokens
+        );
+
+        clearInterval(heartbeat);
+        console.log(`  Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+
+        const finalContent = processContent(fullContent);
+        const id = `chatcmpl-${Date.now()}`;
+        const created = Math.floor(Date.now() / 1000);
+        const mdl = model || 'claude-3-sonnet';
+
+        console.log(`  [output] len=${finalContent.length} think=${finalContent.startsWith('<think>')}`);
+
+        res.write(`data: ${JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model: mdl,
+          choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+        })}\n\n`);
+
+        res.write(`data: ${JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model: mdl,
+          choices: [{ index: 0, delta: { content: finalContent }, finish_reason: null }]
+        })}\n\n`);
+
+        res.write(`data: ${JSON.stringify({
+          id, object: 'chat.completion.chunk', created, model: mdl,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+        })}\n\n`);
+
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+
       } catch (err) {
         lastError = err;
-        const code = err.code || err.response?.status || 'unknown';
-        console.log(`  Attempt ${attempt} failed: ${code} — ${err.message}`);
-
-        if (attempt < 3) {
-          const delay = attempt * 5000;
-          console.log(`  Retrying in ${delay / 1000}s...`);
-          await new Promise(r => setTimeout(r, delay));
-        }
+        console.log(`  Attempt ${attempt} failed: ${err.message}`);
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
       }
     }
 
-    if (!response) {
-      throw lastError;
-    }
-
-    res.json({
+    clearInterval(heartbeat);
+    console.error('  FAILED after all retries');
+    res.write(`data: ${JSON.stringify({
       id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
+      object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model: model || 'claude-3-sonnet',
-      choices: response.data.choices.map(choice => {
-        let content = choice.message?.content || '';
+      choices: [{ index: 0, delta: { role: 'assistant', content: '[Error: API failed after retries. Try again.]' }, finish_reason: 'stop' }]
+    })}\n\n`);
+    res.write('data: [DONE]\n\n');
+    res.end();
 
-        let thinkBlock = '';
-        let body = content;
+  } else {
+    // ── NON-STREAMING: JSON response (still streams from NIM internally) ──
+    let lastError;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log(`  Attempt ${attempt}...`);
+        const { fullContent, finishReason, usage } = await fetchFromNIM(
+          preparedMessages, temperature, max_tokens
+        );
 
-        const thinkMatch = content.match(/^\s*(<think>[\s\S]*?<\/think>)\s*([\s\S]*)$/);
-        if (thinkMatch) {
-          thinkBlock = thinkMatch[1];
-          body = thinkMatch[2];
-        }
+        console.log(`  Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+        const finalContent = processContent(fullContent);
 
-        if (!thinkBlock && choice.message?.reasoning_content) {
-          thinkBlock = '<think>\n' + choice.message.reasoning_content + '\n</think>';
-        }
+        res.json({
+          id: `chatcmpl-${Date.now()}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: model || 'claude-3-sonnet',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: finalContent },
+            finish_reason: finishReason
+          }],
+          usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        });
+        return;
 
-        body = enforceLineBreaks(body);
-
-        const finalContent = thinkBlock
-          ? thinkBlock + '\n\n' + body
-          : body;
-
-        console.log(`  [output] len=${body.length} paragraphs=${(body.match(/\n\n/g) || []).length + 1} think=${!!thinkBlock}`);
-
-        return {
-          index: choice.index,
-          message: { role: choice.message.role, content: finalContent },
-          finish_reason: choice.finish_reason
-        };
-      }),
-      usage: response.data.usage || {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0
+      } catch (err) {
+        lastError = err;
+        console.log(`  Attempt ${attempt} failed: ${err.message}`);
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 5000));
       }
-    });
+    }
 
-  } catch (error) {
-    console.error(`  FAILED after all retries — ${error.code || error.response?.status || 'unknown'}: ${error.message}`);
-    res.status(error.response?.status || 500).json({
+    console.error('  FAILED after all retries');
+    res.status(lastError?.response?.status || 500).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: lastError?.message || 'Internal server error',
         type: 'invalid_request_error',
-        code: error.response?.status || 500
+        code: lastError?.response?.status || 500
       }
     });
   }
