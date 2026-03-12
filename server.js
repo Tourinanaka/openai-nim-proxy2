@@ -11,6 +11,15 @@ app.use(express.json());
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
+// Axios instance with extended timeout (5 minutes)
+const apiClient = axios.create({
+  timeout: 300000,
+  headers: {
+    'Authorization': `Bearer ${NIM_API_KEY}`,
+    'Content-Type': 'application/json'
+  }
+});
+
 // ── Clean history before sending to API ─────────────────
 function prepareMessages(messages) {
   return messages.map(msg => {
@@ -71,6 +80,9 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
   try {
     const { model, messages, temperature, max_tokens } = req.body;
     const preparedMessages = prepareMessages(messages);
@@ -81,23 +93,44 @@ app.post('/v1/chat/completions', async (req, res) => {
       const preview = (m.content || '').substring(0, 200).replace(/\n/g, '\\n');
       console.log(`  [${m.role}] ${preview}`);
     });
+    console.log(`  Sending to NIM API...`);
+    const startTime = Date.now();
 
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, {
-      model: 'z-ai/glm5',
-      messages: preparedMessages,
-      temperature: temperature || 0.85,
-      max_tokens: max_tokens || 9024,
-      stream: false,
-      chat_template_kwargs: {
-        enable_thinking: true,
-        clear_thinking: false
+    // ── Retry logic: 3 attempts ──
+    let response;
+    let lastError;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        response = await apiClient.post(`${NIM_API_BASE}/chat/completions`, {
+          model: 'z-ai/glm5',
+          messages: preparedMessages,
+          temperature: temperature || 0.85,
+          max_tokens: max_tokens || 9024,
+          stream: false,
+          chat_template_kwargs: {
+            enable_thinking: true,
+            clear_thinking: false
+          }
+        });
+        console.log(`  Response received in ${((Date.now() - startTime) / 1000).toFixed(1)}s (attempt ${attempt})`);
+        break;
+      } catch (err) {
+        lastError = err;
+        const code = err.code || err.response?.status || 'unknown';
+        console.log(`  Attempt ${attempt} failed: ${code} — ${err.message}`);
+
+        if (attempt < 3) {
+          const delay = attempt * 5000;
+          console.log(`  Retrying in ${delay / 1000}s...`);
+          await new Promise(r => setTimeout(r, delay));
+        }
       }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    }
+
+    if (!response) {
+      throw lastError;
+    }
 
     res.json({
       id: `chatcmpl-${Date.now()}`,
@@ -142,7 +175,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Proxy error:', error.response?.data || error.message);
+    console.error(`  FAILED after all retries — ${error.code || error.response?.status || 'unknown'}: ${error.message}`);
     res.status(error.response?.status || 500).json({
       error: {
         message: error.message || 'Internal server error',
