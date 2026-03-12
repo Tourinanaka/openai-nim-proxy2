@@ -29,7 +29,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       max_tokens: max_tokens ?? 9024,
       extra_body: {
         chat_template_kwargs: {
-          thinking: true,
           enable_thinking: true,
           clear_thinking: false
         }
