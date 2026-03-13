@@ -35,7 +35,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       model: 'z-ai/glm5',
       messages: preparedMessages,
       temperature: temperature ?? 0.85,
-      max_tokens: max_tokens ?? 5000,
+      max_tokens: max_tokens ?? 3000,
       chat_template_kwargs: {
         thinking: true,
         enable_thinking: true,
@@ -53,7 +53,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let sseBuffer = '';
     let inThink = false;
-    let thinkDone = false;
 
     // --- line break engine (2-char sliding window) ---
     let tail = '';
@@ -61,16 +60,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     function needsBreak(a, sep, c) {
       if (sep === ' ') {
+        // . ! ? then "   →  paragraph before dialogue
         if (/[.!?]/.test(a) && c === '"') return true;
-        if (/[.!?"'*\]]/.test(a) && c === '*') return true;
-        if (a === '*' && /[A-Z"\[]/.test(c)) return true;
-        if (/["']/.test(a) && /[A-Z*\[]/.test(c)) return true;
-        if (a === ']' && /[A-Z"*]/.test(c)) return true;
-        if (/[.!?"'*]/.test(a) && c === '[') return true;
+        // . ! ? " ' * then *   →  paragraph before action
+        if (/[.!?"'*]/.test(a) && c === '*') return true;
+        // * then A-Z or "   →  paragraph after action
+        if (a === '*' && /[A-Z"]/.test(c)) return true;
+        // " ' then A-Z   →  paragraph after dialogue
+        if (/["']/.test(a) && /[A-Z]/.test(c)) return true;
       }
       if (sep === '\n') {
-        if (a !== '\n' && /["*\[]/.test(c)) return true;
-        if (/["'*\]]/.test(a) && /[A-Z*"\[]/.test(c)) return true;
+        // single \n before " or * → upgrade to \n\n
+        if (a !== '\n' && (c === '"' || c === '*')) return true;
+        if (/["']/.test(a) && /[A-Z*]/.test(c)) return true;
       }
       return false;
     }
@@ -81,12 +83,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       while (tail.length >= 3) {
         if (needsBreak(tail[0], tail[1], tail[2])) {
           raw += tail[0] + '\n\n';
-          tail = tail.slice(2);
+          tail = tail.slice(2);   // skip the space/\n, keep char c
         } else {
           raw += tail[0];
           tail = tail.slice(1);
         }
       }
+      // collapse 3+ newlines → 2
       let out = '';
       for (const ch of raw) {
         if (ch === '\n') { nlRun++; if (nlRun <= 2) out += '\n'; }
@@ -113,7 +116,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-        if (line.includes('[DONE]')) continue;
+        if (line.includes('[DONE]')) continue;   // sent on 'end'
 
         try {
           const data = JSON.parse(line.slice(6));
@@ -129,12 +132,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           else if (r) { out = r; }
 
           // transition think → content
-          if (c && inThink) { out += '</think>\n\n'; inThink = false; thinkDone = true; }
-
-          // drop content that arrives before think starts
-          if (c && !thinkDone && !inThink) {
-            c = '';
-          }
+          if (c && inThink) { out += '</think>\n\n'; inThink = false; }
 
           // content → fix line breaks in real-time
           if (c) out += fixBreaks(c);
