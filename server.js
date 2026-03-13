@@ -28,7 +28,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       temperature: temperature ?? 0.85,
       max_tokens: max_tokens ?? 9024,
       chat_template_kwargs: {
-        thinking: true,
         enable_thinking: true,
         clear_thinking: false
       },
@@ -44,17 +43,15 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let buffer = '';
     let inThink = false;
-    let strippingContent = false;
 
-    const closeThink = () => {
+    // ── helper: force-close an open <think> block ──
+    const flushThinkClose = () => {
       if (!inThink) return;
-      const data = {
-        id: `chatcmpl-${Date.now()}`,
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { content: '\n</think>\n\n' }, finish_reason: null }]
-      };
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
       inThink = false;
+      const patch = {
+        choices: [{ delta: { content: '\n</think>\n\n' }, index: 0 }]
+      };
+      res.write(`data: ${JSON.stringify(patch)}\n\n`);
     };
 
     nimRes.data.on('data', (chunk) => {
@@ -64,8 +61,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
+
         if (line.includes('[DONE]')) {
-          closeThink();
+          flushThinkClose();               // ← FIX: close before [DONE]
           res.write('data: [DONE]\n\n');
           return;
         }
@@ -78,17 +76,16 @@ app.post('/v1/chat/completions', async (req, res) => {
             let r = delta.reasoning_content || '';
             let c = delta.content || '';
 
-            // Strip <think> tags leaked into content by clear_thinking: false
-            c = c.replace(/<think>/g, '').replace(/<\/think>/g, '');
-            if (c.trim() === '') c = '';
+            // ── FIX: strip embedded <think> tags to prevent duplication ──
+            if (r) c = c.replace(/<\/?think>/g, '');
 
             let out = '';
 
             if (r && !inThink) { out = '<think>\n' + r; inThink = true; }
-            else if (r) { out = r; }
+            else if (r)        { out = r; }
 
-            if (c && inThink) { out += '\n</think>\n\n' + c; inThink = false; }
-            else if (c) { out += c; }
+            if (c && inThink)  { out += '\n</think>\n\n' + c; inThink = false; }
+            else if (c)        { out += c; }
 
             delta.content = out;
             delete delta.reasoning_content;
@@ -99,8 +96,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     });
 
-    nimRes.data.on('end', () => { closeThink(); res.end(); });
-    nimRes.data.on('error', () => { closeThink(); res.end(); });
+    nimRes.data.on('end', () => {
+      flushThinkClose();                   // ← FIX: close on stream end
+      res.end();
+    });
+
+    nimRes.data.on('error', () => {
+      flushThinkClose();                   // ← FIX: close on error too
+      res.end();
+    });
+
   } catch (err) {
     console.error('Error:', err.message);
     res.status(err.response?.status || 500).json({ error: { message: err.message } });
