@@ -41,29 +41,28 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    let buffer = '';
-    let inThink = false;
+    let sseBuffer = '';
+    let inThink = false;          // our <think> wrapper is open
+    let hadReasoning = false;     // we saw reasoning_content at some point
+    let droppingReplay = false;   // currently inside a <think> block in content (duplicate)
 
-    // ── helper: force-close an open <think> block ──
     const flushThinkClose = () => {
       if (!inThink) return;
       inThink = false;
-      const patch = {
+      res.write(`data: ${JSON.stringify({
         choices: [{ delta: { content: '\n</think>\n\n' }, index: 0 }]
-      };
-      res.write(`data: ${JSON.stringify(patch)}\n\n`);
+      })}\n\n`);
     };
 
     nimRes.data.on('data', (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      sseBuffer += chunk.toString();
+      const lines = sseBuffer.split('\n');
+      sseBuffer = lines.pop() || '';
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-
         if (line.includes('[DONE]')) {
-          flushThinkClose();               // ← FIX: close before [DONE]
+          flushThinkClose();
           res.write('data: [DONE]\n\n');
           return;
         }
@@ -71,40 +70,56 @@ app.post('/v1/chat/completions', async (req, res) => {
         try {
           const data = JSON.parse(line.slice(6));
           const delta = data.choices?.[0]?.delta;
+          if (!delta) { res.write(`data: ${JSON.stringify(data)}\n\n`); continue; }
 
-          if (delta) {
-            let r = delta.reasoning_content || '';
-            let c = delta.content || '';
+          let r = delta.reasoning_content || '';
+          let c = delta.content || '';
+          let out = '';
 
-            // ── FIX: strip embedded <think> tags to prevent duplication ──
-            if (r) c = c.replace(/<\/?think>/g, '');
-
-            let out = '';
-
-            if (r && !inThink) { out = '<think>\n' + r; inThink = true; }
-            else if (r)        { out = r; }
-
-            if (c && inThink)  { out += '\n</think>\n\n' + c; inThink = false; }
-            else if (c)        { out += c; }
-
-            delta.content = out;
-            delete delta.reasoning_content;
+          // ── reasoning_content → wrap in <think> (the REAL thinking stream) ──
+          if (r) {
+            hadReasoning = true;
+            if (!inThink) { out += '<think>\n' + r; inThink = true; }
+            else { out += r; }
           }
 
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
+          // ── content → strip the duplicate <think>…</think> replay ──
+          if (c) {
+            if (inThink) { out += '\n</think>\n\n'; inThink = false; }
+
+            // start dropping when we hit the replayed <think> block
+            if (!droppingReplay && hadReasoning && c.includes('<think>')) {
+              droppingReplay = true;
+              const idx = c.indexOf('<think>');
+              out += c.slice(0, idx);        // keep anything before <think> (usually nothing)
+              c = c.slice(idx + 7);          // skip past <think>
+            }
+
+            if (droppingReplay) {
+              if (c.includes('</think>')) {
+                c = c.slice(c.indexOf('</think>') + 8); // keep only text AFTER </think>
+                droppingReplay = false;
+              } else {
+                c = '';                       // still inside replay → drop
+              }
+            }
+
+            out += c;
+          }
+
+          delta.content = out;
+          delete delta.reasoning_content;
+
+          const fr = data.choices?.[0]?.finish_reason;
+          if (out || fr) {
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          }
         } catch (e) {}
       }
     });
 
-    nimRes.data.on('end', () => {
-      flushThinkClose();                   // ← FIX: close on stream end
-      res.end();
-    });
-
-    nimRes.data.on('error', () => {
-      flushThinkClose();                   // ← FIX: close on error too
-      res.end();
-    });
+    nimRes.data.on('end', () => { flushThinkClose(); res.end(); });
+    nimRes.data.on('error', () => { flushThinkClose(); res.end(); });
 
   } catch (err) {
     console.error('Error:', err.message);
