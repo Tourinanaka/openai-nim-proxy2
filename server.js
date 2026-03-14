@@ -32,10 +32,10 @@ app.post('/v1/chat/completions', async (req, res) => {
     const preparedMessages = prepareMessages(messages);
 
     const nimRes = await axios.post(`${NIM_BASE}/chat/completions`, {
-      model: 'z-ai/glm5',
+      model: 'z-ai/glm4.7',
       messages: preparedMessages,
       temperature: temperature ?? 0.85,
-      max_tokens: max_tokens ?? 9000,
+      max_tokens: max_tokens ?? 5000,
       chat_template_kwargs: {
         thinking: true,
         enable_thinking: true,
