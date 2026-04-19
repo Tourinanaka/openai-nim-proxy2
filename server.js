@@ -39,7 +39,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       chat_template_kwargs: {
         thinking: true,
         enable_thinking: true,
-        clear_thinking: false
+        clear_thinking: true
       },
       stream: true
     }, {
